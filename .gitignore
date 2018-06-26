@@ -1,0 +1,3 @@
+*.pyc
+/.pants.workdir.file_lock
+/.pids/
