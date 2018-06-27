@@ -1,0 +1,10 @@
+language: python
+python:
+  - "3.6"
+
+script:
+  - "./pants binary ::"
+  - "for pex in dist/*.pex; do echo executing ${pex} && ${pex}; done"
+  - "./pants run apps/gardener"
+  - "./pants run libraries/shrubbery-lib"
+  - "./pants test ::"
