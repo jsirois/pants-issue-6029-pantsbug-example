@@ -1,33 +1,40 @@
 import os
 import shutil
-import subprocess
 
 from pants.backend.python.targets.python_library import PythonLibrary
-from pants.backend.python.tasks.python_execution_task_base import PythonExecutionTaskBase
+from pants.backend.python.tasks import pex_build_util
+from pants.backend.python.tasks.resolve_requirements import ResolveRequirements
 from pants.base.build_environment import get_buildroot
+from pants.base.exceptions import TaskError
 from pants.base.payload import Payload
+from pants.base.payload_field import PrimitiveField
 from pants.build_graph.resources import Resources
 from pants.task.simple_codegen_task import SimpleCodegenTask
+from pants.util.contextutil import temporary_dir
 from pants.util.dirutil import safe_mkdir_for
+from pex.interpreter import PythonInterpreter
+from pex.pex import PEX
+from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
 
 
 class CompileCython(PythonLibrary):
-    def __init__(self, inputs=None, payload=None, output=None, address=None, **kwargs):
-        inputs = inputs.legacy_globs_class.create_fileset_with_spec(address.spec_path, *inputs.filespecs['globs'])
+    def __init__(self, payload=None, address=None, output=None, **kwargs):
         payload = payload or Payload()
-        payload.add_fields({
-            'inputs': self.create_sources_field(inputs, sources_rel_path=address.spec_path, key_arg='sources')
-        })
-        self.output = output
+        payload.add_field('output', PrimitiveField(output))
         super(CompileCython, self).__init__(payload=payload, address=address, **kwargs)
 
+    @property
+    def output(self):
+        return self.payload.output
 
-class CompileCythonCreate(SimpleCodegenTask, PythonExecutionTaskBase):
-    """
-    This is both a SimpleCodegenTask because it generates a so and a PythonExecutionTaskBase because it needs to run python code in order
-    to generate the so.
-    """
+
+class CompileCythonCreate(SimpleCodegenTask):
+
+    @classmethod
+    def prepare(cls, options, round_manager):
+        round_manager.require_data(PythonInterpreter)
+        round_manager.require_data(ResolveRequirements.REQUIREMENTS_PEX)
 
     @classmethod
     def product_types(cls):
@@ -37,43 +44,66 @@ class CompileCythonCreate(SimpleCodegenTask, PythonExecutionTaskBase):
     def cache_target_dirs(self):
         return True
 
-    @property
-    def create_target_dirs(self):
-        return True
-
-    def __init__(self, context, workdir):
-        super(CompileCythonCreate, self).__init__(context, workdir)
-
     def execute_codegen(self, target, results_dir):
-        self.context.log.info("Processing target %s" % target)
+        self.context.log.info("Processing target {}".format(target))
 
-        # Creating the pex can, as a side effect, change the location of the symbolic link pants creates
-        result = self.create_pex(PexInfo.default())
-        full_path = os.path.join(get_buildroot(), target.target_base)
-        # subprocess.check_call(['cmake', full_path], cwd=results_dir)
-        # subprocess.check_call(['make'], cwd=results_dir)
+        requirements_pex = self.context.products.get_data(ResolveRequirements.REQUIREMENTS_PEX)
 
-        result_code = result.run(
-            with_chroot=True,
-            blocking=True,
-            args=(os.path.join(full_path, 'setup.py'), 'build_ext', '--inplace', '--verbose'),
-            # Passing PATH helps cython find the correct c++ compiler
-            env={'libraries': results_dir, 'PATH': os.getenv('PATH')}
-        )
+        interpreter = self.context.products.get_data(PythonInterpreter)
+        pex_info = PexInfo.default(interpreter)
+        pex_info.pex_path = requirements_pex.path()
+        with temporary_dir() as source_pex_chroot:
+            sources_pex_builder = PEXBuilder(
+                path=source_pex_chroot,
+                interpreter=interpreter,
+                copy=True,
+                pex_info=pex_info
+            )
+            pex_build_util.dump_sources(sources_pex_builder, target, self.context.log)
+            sources_pex_builder.freeze()
+            codegen_pex = PEX(sources_pex_builder.path(), interpreter)
 
-        if result_code != 0:
-            raise ValueError('creating cython library failed')
+            setup_py_paths = []
+            for source in target.sources_relative_to_source_root():
+                if os.path.basename(source) == 'setup.py':
+                    setup_py_paths.append(source)
+            if len(setup_py_paths) != 1:
+                raise TaskError(
+                    'Expected target {} to own exactly one setup.py, found {}'.format(
+                        setup_py_paths,
+                        len(setup_py_paths)
+                    )
+                )
+            setup_py_path = setup_py_paths[0]
 
-        library_source_path = os.path.join(result.path(), target.output)
+            result_code = codegen_pex.run(
+                with_chroot=True,
+                blocking=True,
+                args=(setup_py_path, 'build_ext', '--inplace', '--verbose'),
+                # Passing PATH helps cython find the correct c++ compiler
+                env={'libraries': results_dir, 'PATH': os.getenv('PATH')}
+            )
 
-        library_output = os.path.join(results_dir, target.output)
-        safe_mkdir_for(library_output)
-        shutil.move(library_source_path, library_output)
+            if result_code != 0:
+                raise TaskError(
+                    'creating cython library failed',
+                    exit_code=result_code,
+                    failed_targets=[target]
+                )
 
-        self.context.log.info('created library {}'.format(os.path.relpath(target.output, get_buildroot())))
+            library_source_path = os.path.join(
+                sources_pex_builder.path(),
+                os.path.dirname(setup_py_path),
+                target.output
+            )
 
-    def synthetic_target_type_by_target(self, target):
-        return Resources
+            library_output = os.path.join(results_dir, target.output)
+            safe_mkdir_for(library_output)
+            shutil.move(library_source_path, library_output)
+
+            self.context.log.info(
+                'created library {}'.format(os.path.relpath(library_output, get_buildroot()))
+            )
 
     def synthetic_target_type(self, target):
         return Resources

@@ -1,6 +1,6 @@
 compile_cython(
   name='compile-plugins',
-  inputs=rglobs('*.*'),
+  sources=rglobs('*.*'),
   output='shrubberylib.cpython-36m-x86_64-linux-gnu.so',
   dependencies=['3rdparty:cython'],
 )
